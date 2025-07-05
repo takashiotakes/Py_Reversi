@@ -2,6 +2,8 @@ import pygame
 import sys
 import time
 from pygame.locals import *
+import threading
+import random
 
 # 色の定義
 BLACK = (0, 0, 0)
@@ -60,14 +62,22 @@ class ReversiGame:
         self.slider_drag = False
         self.slider_rect = None
         self.player_btn_rects = [[None, None], [None, None]]
+        self.transposition_table = {}
+        self.ponder_thread = None
+        self.ponder_result = None
+        self.ponder_move = None
+        self.ponder_stop = threading.Event()
+        self.killer_moves = {}
+        self.history_heuristic = {}
+        self.ai_mode = "AlphaBeta"  # "AlphaBeta" or "MCTS"
 
     def save_state(self):
-        # Undo/Redo用に盤面・プレイヤー状態を保存
+        # Undo/Redo用に盤面・プレイヤー状態を保存（player_typesは保存しない）
         import copy
-        return (copy.deepcopy(self.board), self.current_player, self.player_types[:], self.dark_mode, self.ai_depth)
+        return (copy.deepcopy(self.board), self.current_player, self.dark_mode, self.ai_depth)
 
     def load_state(self, state):
-        self.board, self.current_player, self.player_types, self.dark_mode, self.ai_depth = state
+        self.board, self.current_player, self.dark_mode, self.ai_depth = state
         self.game_over = False
         self.best_move = None
 
@@ -334,18 +344,102 @@ class ReversiGame:
         txt2 = self.font.render("Toggle Dark Mode", True, WHITE if not self.dark_mode else BLACK)
         self.screen.blit(txt2, (btn_x2 + 30, btn_y2 + 10))
         self.button_rects["DarkMode"] = pygame.Rect(btn_x2, btn_y2, btn_w2, btn_h2)
+        # AIロジック切り替えボタン（Hintと被らず中間位置、幅縮小）
+        btn_w3, btn_h3 = 90, 36  # 幅を3/4に
+        # Hintボタンの右隣から少し間隔を空けて配置
+        hint_rect = self.button_rects["Hint"]
+        btn_x3 = hint_rect.right + 30  # Hintボタン右端+30px
+        btn_y3 = y0
+        for i, mode in enumerate(["AlphaBeta", "MCTS"]):
+            rect = pygame.Rect(btn_x3, btn_y3 + i*(btn_h3+10), btn_w3, btn_h3)
+            color = (100, 200, 100) if self.ai_mode == mode else (220,220,220)
+            pygame.draw.rect(self.screen, color, rect, border_radius=8)
+            txt = self.small_font.render(mode, True, BLACK if not self.dark_mode else WHITE)
+            self.screen.blit(txt, (rect.x+10, rect.y+7))
+            self.button_rects[mode] = rect
+
+    def count_frontier_discs(self, board, player):
+        frontier = 0
+        for y in range(BOARD_SIZE):
+            for x in range(BOARD_SIZE):
+                if board[y][x] == player:
+                    for dx, dy in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                            if board[ny][nx] == 0:
+                                frontier += 1
+                                break
+        return frontier
+
+    def get_strong_stable_discs(self, board, player):
+        # 全8方向で角から伝播する厳密な確定石判定
+        stable = [[False]*BOARD_SIZE for _ in range(BOARD_SIZE)]
+        # 角から全方向に伝播
+        for sx, sy in [(0,0),(0,BOARD_SIZE-1),(BOARD_SIZE-1,0),(BOARD_SIZE-1,BOARD_SIZE-1)]:
+            if board[sy][sx] == player:
+                stable[sy][sx] = True
+        changed = True
+        directions = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]
+        while changed:
+            changed = False
+            for y in range(BOARD_SIZE):
+                for x in range(BOARD_SIZE):
+                    if board[y][x] != player or stable[y][x]:
+                        continue
+                    stable_dirs = 0
+                    for dx, dy in directions:
+                        nx, ny = x, y
+                        while 0 <= nx+dx < BOARD_SIZE and 0 <= ny+dy < BOARD_SIZE:
+                            nx += dx
+                            ny += dy
+                            if board[ny][nx] != player:
+                                break
+                            if stable[ny][nx]:
+                                stable_dirs += 1
+                                break
+                        else:
+                            stable_dirs += 1
+                    if stable_dirs == 8:
+                        stable[y][x] = True
+                        changed = True
+        return sum(stable[y][x] for y in range(BOARD_SIZE) for x in range(BOARD_SIZE)), stable
 
     def evaluate_board(self, board, player):
-        weights = [
-            [120, -20, 20, 5, 5, 20, -20, 120],
-            [-20, -40, -5, -5, -5, -5, -40, -20],
-            [20, -5, 15, 3, 3, 15, -5, 20],
-            [5, -5, 3, 3, 3, 3, -5, 5],
-            [5, -5, 3, 3, 3, 3, -5, 5],
-            [20, -5, 15, 3, 3, 15, -5, 20],
-            [-20, -40, -5, -5, -5, -5, -40, -20],
-            [120, -20, 20, 5, 5, 20, -20, 120],
-        ]
+        # 進行度による重み切り替え
+        empty_count = sum(row.count(0) for row in board)
+        if empty_count > 44:  # 序盤
+            weights = [
+                [150, -40, 30, 10, 10, 30, -40, 150],
+                [-40, -60, -5, -5, -5, -5, -60, -40],
+                [30, -5, 20, 3, 3, 20, -5, 30],
+                [10, -5, 3, 3, 3, 3, -5, 10],
+                [10, -5, 3, 3, 3, 3, -5, 10],
+                [30, -5, 20, 3, 3, 20, -5, 30],
+                [-40, -60, -5, -5, -5, -5, -60, -40],
+                [150, -40, 30, 10, 10, 30, -40, 150],
+            ]
+        elif empty_count > 20:  # 中盤
+            weights = [
+                [120, -20, 20, 5, 5, 20, -20, 120],
+                [-20, -40, -5, -5, -5, -5, -40, -20],
+                [20, -5, 15, 3, 3, 15, -5, 20],
+                [5, -5, 3, 3, 3, 3, -5, 5],
+                [5, -5, 3, 3, 3, 3, -5, 5],
+                [20, -5, 15, 3, 3, 15, -5, 20],
+                [-20, -40, -5, -5, -5, -5, -40, -20],
+                [120, -20, 20, 5, 5, 20, -20, 120],
+            ]
+        else:  # 終盤
+            weights = [
+                [100, -10, 10, 2, 2, 10, -10, 100],
+                [-10, -20, -2, -2, -2, -2, -20, -10],
+                [10, -2, 8, 1, 1, 8, -2, 10],
+                [2, -2, 1, 1, 1, 1, -2, 2],
+                [2, -2, 1, 1, 1, 1, -2, 2],
+                [10, -2, 8, 1, 1, 8, -2, 10],
+                [-10, -20, -2, -2, -2, -2, -20, -10],
+                [100, -10, 10, 2, 2, 10, -10, 100],
+            ]
         score = 0
         opponent = 3 - player
         for y in range(BOARD_SIZE):
@@ -360,22 +454,173 @@ class ReversiGame:
         my_moves = len(self.get_valid_moves(board, player))
         op_moves = len(self.get_valid_moves(board, opponent))
         score += (my_moves - op_moves) * 5
+        # フロンティアディスク
+        my_frontier = self.count_frontier_discs(board, player)
+        op_frontier = self.count_frontier_discs(board, opponent)
+        score -= (my_frontier - op_frontier) * 4
+        # 厳密な確定石
+        my_strong_stable, my_stable_map = self.get_strong_stable_discs(board, player)
+        op_strong_stable, op_stable_map = self.get_strong_stable_discs(board, opponent)
+        score += (my_strong_stable - op_strong_stable) * 30
+        # フロンティアの安定性強化
+        for y in range(BOARD_SIZE):
+            for x in range(BOARD_SIZE):
+                if board[y][x] == player:
+                    for dx, dy in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                            if board[ny][nx] == 0:
+                                if my_stable_map[y][x]:
+                                    score += 8
+                                break
+        # パリティ評価
+        empty = [[board[y][x] == 0 for x in range(BOARD_SIZE)] for y in range(BOARD_SIZE)]
+        parity_bonus = 0
+        for y in range(BOARD_SIZE):
+            for x in range(BOARD_SIZE):
+                if empty[y][x]:
+                    cnt = 0
+                    for dx, dy in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and empty[ny][nx]:
+                            cnt += 1
+                    if cnt % 2 == 0:
+                        parity_bonus += 1
+                    else:
+                        parity_bonus -= 1
+        score += parity_bonus * 2
+        # X-square, C-square, A-square危険度評価
+        x_squares = [(1,1),(1,6),(6,1),(6,6)]
+        c_squares = [(0,1),(1,0),(0,6),(1,7),(6,0),(7,1),(6,7),(7,6)]
+        a_squares = [(0,2),(2,0),(0,5),(2,7),(5,0),(7,2),(5,7),(7,5)]
+        for (x, y) in x_squares:
+            if board[y][x] == player:
+                score -= 25
+            elif board[y][x] == opponent:
+                score += 25
+        for (x, y) in c_squares:
+            if board[y][x] == player:
+                score -= 15
+            elif board[y][x] == opponent:
+                score += 15
+        for (x, y) in a_squares:
+            if board[y][x] == player:
+                score -= 8
+            elif board[y][x] == opponent:
+                score += 8
+        # モビリティの先読み（2手先・3手先）
+        def lookahead_mobility(b, p, depth):
+            if depth == 0:
+                return len(self.get_valid_moves(b, p))
+            moves = self.get_valid_moves(b, p)
+            if not moves:
+                return 0
+            total = 0
+            for x, y in moves:
+                new_b = [row[:] for row in b]
+                self._simulate_move(new_b, p, x, y)
+                total += lookahead_mobility(new_b, 3-p, depth-1)
+            return total
+        score += (lookahead_mobility(board, player, 2) - lookahead_mobility(board, opponent, 2))
+        # パターンベース評価
+        # 辺
+        for y in [0, 7]:
+            for x in range(BOARD_SIZE):
+                if board[y][x] == player:
+                    score += 2
+                elif board[y][x] == 3-player:
+                    score -= 2
+        for x in [0, 7]:
+            for y in range(BOARD_SIZE):
+                if board[y][x] == player:
+                    score += 2
+                elif board[y][x] == 3-player:
+                    score -= 2
+        # 角周り
+        for (cx, cy) in [(0,0),(0,7),(7,0),(7,7)]:
+            for dx in [-1,0,1]:
+                for dy in [-1,0,1]:
+                    nx, ny = cx+dx, cy+dy
+                    if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and (nx,ny)!=(cx,cy):
+                        if board[ny][nx] == player:
+                            score -= 3
+                        elif board[ny][nx] == 3-player:
+                            score += 3
+        # 斜め列
+        for i in range(BOARD_SIZE):
+            if board[i][i] == player:
+                score += 1
+            elif board[i][i] == 3-player:
+                score -= 1
+            if board[i][BOARD_SIZE-1-i] == player:
+                score += 1
+            elif board[i][BOARD_SIZE-1-i] == 3-player:
+                score -= 1
+        # ノイズ付与による多様性
+        score += random.randint(-2, 2)
         return score
 
-    def find_best_move(self, player):
+    def find_best_move(self, player, max_time=2.0):
+        import time
         moves = self.get_valid_moves(self.board, player)
         if not moves:
             return None
-        best_score = -float('inf')
+        empty_count = sum(row.count(0) for row in self.board)
+        if empty_count <= 12:
+            max_depth = empty_count
+        else:
+            max_depth = self.ai_depth
         best_move = None
-        for x, y in moves:
-            new_board = [row[:] for row in self.board]
-            self._simulate_move(new_board, player, x, y)
-            score = self.alpha_beta(new_board, 3 - player, self.ai_depth-1, -float('inf'), float('inf'))
-            if score > best_score:
-                best_score = score
-                best_move = (x, y)
+        best_score = -float('inf')
+        start = time.time()
+        for depth in range(1, max_depth+1):
+            for x, y in moves:
+                if time.time() - start > max_time:
+                    return best_move
+                new_board = [row[:] for row in self.board]
+                self._simulate_move(new_board, player, x, y)
+                score = self.alpha_beta(new_board, 3 - player, depth-1, -float('inf'), float('inf'))
+                if score > best_score or best_move is None:
+                    best_score = score
+                    best_move = (x, y)
         return best_move
+
+    def mcts_best_move(self, player, simulations=100):
+        moves = self.get_valid_moves(self.board, player)
+        if not moves:
+            return None
+        win_counts = {move: 0 for move in moves}
+        for move in moves:
+            for _ in range(simulations):
+                board_copy = [row[:] for row in self.board]
+                self._simulate_move(board_copy, player, move[0], move[1])
+                winner = self.mcts_playout(board_copy, 3-player)
+                if winner == player:
+                    win_counts[move] += 1
+        best_move = max(moves, key=lambda m: win_counts[m])
+        return best_move
+
+    def mcts_playout(self, board, player):
+        current = player
+        while True:
+            moves = self.get_valid_moves(board, current)
+            if not moves:
+                current = 3 - current
+                moves = self.get_valid_moves(board, current)
+                if not moves:
+                    break
+            move = random.choice(moves)
+            self._simulate_move(board, current, move[0], move[1])
+            current = 3 - current
+        # 勝者判定
+        black = sum(row.count(1) for row in board)
+        white = sum(row.count(2) for row in board)
+        if black > white:
+            return 1
+        elif white > black:
+            return 2
+        else:
+            return 0
 
     def _simulate_move(self, board, player, x, y):
         board[y][x] = player
@@ -393,33 +638,182 @@ class ReversiGame:
                 for fx, fy in stones:
                     board[fy][fx] = player
 
-    def alpha_beta(self, board, player, depth, alpha, beta):
+    def board_hash(self, board, player):
+        # 盤面の対称性を考慮したハッシュ
+        boards = [
+            tuple(tuple(row) for row in board),
+            tuple(tuple(row[::-1]) for row in board),  # 左右反転
+            tuple(tuple(board[y]) for y in range(BOARD_SIZE-1, -1, -1)),  # 上下反転
+            tuple(tuple(board[y][::-1]) for y in range(BOARD_SIZE-1, -1, -1)),  # 上下左右反転
+            tuple(tuple(board[x][y] for x in range(BOARD_SIZE)) for y in range(BOARD_SIZE)),  # 転置
+            tuple(tuple(board[x][y] for x in range(BOARD_SIZE-1, -1, -1)) for y in range(BOARD_SIZE)),  # 転置左右
+            tuple(tuple(board[x][y] for x in range(BOARD_SIZE)) for y in range(BOARD_SIZE-1, -1, -1)),  # 転置上下
+            tuple(tuple(board[x][y] for x in range(BOARD_SIZE-1, -1, -1)) for y in range(BOARD_SIZE-1, -1, -1)),  # 転置上下左右
+        ]
+        min_hash = min(boards)
+        return (min_hash, player)
+
+    def quiescence(self, board, player, alpha, beta):
+        stand_pat = self.evaluate_board(board, player)
+        if stand_pat >= beta:
+            return beta
+        if alpha < stand_pat:
+            alpha = stand_pat
         moves = self.get_valid_moves(board, player)
-        if depth == 0 or not moves:
-            return self.evaluate_board(board, player)
-        if player == self.current_player:
-            value = -float('inf')
-            for x, y in moves:
+        # 返せる石が多い手だけ探索
+        for x, y in moves:
+            flip_count = 0
+            directions = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]
+            for dx, dy in directions:
+                nx, ny = x+dx, y+dy
+                while 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
+                    if board[ny][nx] == 3-player:
+                        flip_count += 1
+                    elif board[ny][nx] == player or board[ny][nx] == 0:
+                        break
+                    nx += dx
+                    ny += dy
+            if flip_count >= 3:  # 荒れた手のみ
                 new_board = [row[:] for row in board]
                 self._simulate_move(new_board, player, x, y)
-                value = max(value, self.alpha_beta(new_board, 3 - player, depth-1, alpha, beta))
-                alpha = max(alpha, value)
-                if alpha >= beta:
+                score = -self.quiescence(new_board, 3-player, -beta, -alpha)
+                if score >= beta:
+                    return beta
+                if score > alpha:
+                    alpha = score
+        return alpha
+
+    def alpha_beta(self, board, player, depth, alpha, beta, pvs=True):
+        key = self.board_hash(board, player)
+        if key in self.transposition_table:
+            entry = self.transposition_table[key]
+            if entry['depth'] >= depth:
+                return entry['value']
+        moves = self.get_valid_moves(board, player)
+        if depth == 0 or not moves:
+            return self.quiescence(board, player, alpha, beta)
+        # Multi-ProbCut
+        if depth >= 4:
+            margin = 100
+            probcut_beta = beta + margin
+            probcut_score = self.alpha_beta(board, player, depth-2, probcut_beta-1, probcut_beta, pvs)
+            if probcut_score >= probcut_beta:
+                return probcut_score
+            probcut_alpha = alpha - margin
+            probcut_score = self.alpha_beta(board, player, depth-2, probcut_alpha, probcut_alpha+1, pvs)
+            if probcut_score <= probcut_alpha:
+                return probcut_score
+        # Killer Move/History Heuristic
+        killer = self.killer_moves.get((key, depth))
+        if killer and killer in moves:
+            moves = [killer] + [m for m in moves if m != killer]
+        else:
+            moves = sorted(moves, key=lambda m: -self.history_heuristic.get((key, m), 0))
+        # Null Move Pruning
+        if depth >= 2 and len(moves) > 0:
+            null_board = [row[:] for row in board]
+            null_score = -self.alpha_beta(null_board, 3 - player, depth-2, -beta, -beta+1, pvs)
+            if null_score >= beta:
+                return null_score
+        reduction = 1 if depth >= 3 else 0
+        if player == self.current_player:
+            value = -float('inf')
+            for i, (x, y) in enumerate(moves):
+                new_board = [row[:] for row in board]
+                self._simulate_move(new_board, player, x, y)
+                d = depth-1
+                if i >= 2 and reduction:
+                    d -= 1
+                if pvs and i > 0:
+                    v = -self.alpha_beta(new_board, 3 - player, d, -alpha-1, -alpha, pvs)
+                    if v > alpha:
+                        v = -self.alpha_beta(new_board, 3 - player, d, -beta, -alpha, pvs)
+                else:
+                    v = -self.alpha_beta(new_board, 3 - player, d, -beta, -alpha, pvs)
+                if v > value:
+                    value = v
+                if value > alpha:
+                    alpha = value
+                if value >= beta:
+                    self.killer_moves[(key, depth)] = (x, y)
+                    self.history_heuristic[(key, (x, y))] = self.history_heuristic.get((key, (x, y)), 0) + 1
                     break
+            self.transposition_table[key] = {'value': value, 'depth': depth}
             return value
         else:
             value = float('inf')
-            for x, y in moves:
+            for i, (x, y) in enumerate(moves):
                 new_board = [row[:] for row in board]
                 self._simulate_move(new_board, player, x, y)
-                value = min(value, self.alpha_beta(new_board, 3 - player, depth-1, alpha, beta))
-                beta = min(beta, value)
-                if beta <= alpha:
+                d = depth-1
+                if i >= 2 and reduction:
+                    d -= 1
+                if pvs and i > 0:
+                    v = -self.alpha_beta(new_board, 3 - player, d, -alpha-1, -alpha, pvs)
+                    if v < beta:
+                        v = -self.alpha_beta(new_board, 3 - player, d, -beta, -alpha, pvs)
+                else:
+                    v = -self.alpha_beta(new_board, 3 - player, d, -beta, -alpha, pvs)
+                if v < value:
+                    value = v
+                if value < beta:
+                    beta = value
+                if value <= alpha:
+                    self.killer_moves[(key, depth)] = (x, y)
+                    self.history_heuristic[(key, (x, y))] = self.history_heuristic.get((key, (x, y)), 0) + 1
                     break
+            self.transposition_table[key] = {'value': value, 'depth': depth}
             return value
 
     def is_valid_move(self, x, y):
         return self.is_valid_move_for(self.board, self.current_player, x, y)
+
+    def start_pondering(self):
+        # Human手番中にAIが次の手を予測して先読み
+        if self.player_types[self.current_player-1] != "Human":
+            return
+        board_copy = [row[:] for row in self.board]
+        player = self.current_player
+        moves = self.get_valid_moves(board_copy, player)
+        if not moves:
+            return
+        # 予測：Humanが最善手を打つと仮定
+        best_score = -float('inf')
+        best_move = None
+        for x, y in moves:
+            new_board = [row[:] for row in board_copy]
+            self._simulate_move(new_board, player, x, y)
+            score = self.evaluate_board(new_board, 3 - player)
+            if score > best_score:
+                best_score = score
+                best_move = (x, y)
+        if best_move is None:
+            return
+        def ponder():
+            self.ponder_stop.clear()
+            # Humanがbest_moveを打った後の局面を先読み
+            new_board = [row[:] for row in board_copy]
+            self._simulate_move(new_board, player, best_move[0], best_move[1])
+            ai_player = 3 - player
+            move = self.find_best_move(ai_player)
+            if self.ponder_stop.is_set():
+                return
+            self.ponder_result = move
+            self.ponder_move = best_move
+        self.ponder_result = None
+        self.ponder_move = None
+        if self.ponder_thread and self.ponder_thread.is_alive():
+            self.ponder_stop.set()
+            self.ponder_thread.join()
+        self.ponder_thread = threading.Thread(target=ponder)
+        self.ponder_thread.start()
+
+    def stop_pondering(self):
+        if self.ponder_thread and self.ponder_thread.is_alive():
+            self.ponder_stop.set()
+            self.ponder_thread.join()
+        self.ponder_result = None
+        self.ponder_move = None
 
     def run(self):
         try:
@@ -429,6 +823,7 @@ class ReversiGame:
                 self.draw_board()
                 for event in pygame.event.get():
                     if event.type == QUIT:
+                        self.stop_pondering()
                         pygame.quit()
                         sys.exit()
                     if event.type == MOUSEBUTTONDOWN:
@@ -439,14 +834,18 @@ class ReversiGame:
                             x = (mx - board_left) // CELL_SIZE
                             y = (my - board_top) // CELL_SIZE
                             self.make_move(x, y)
+                            self.stop_pondering()
                         for label, rect in self.button_rects.items():
                             if rect.collidepoint(mx, my):
                                 if label == "Reset":
                                     self.reset_board()
+                                    self.stop_pondering()
                                 elif label == "Undo":
                                     self.undo()
+                                    self.stop_pondering()
                                 elif label == "Redo":
                                     self.redo()
+                                    self.stop_pondering()
                                 elif label == "Hint":
                                     if not self.hint_mode:
                                         self.best_move = self.find_best_move(self.current_player)
@@ -455,6 +854,8 @@ class ReversiGame:
                                     self.hint_mode = not self.hint_mode
                                 elif label == "DarkMode":
                                     self.dark_mode = not self.dark_mode
+                                elif label in ["AlphaBeta", "MCTS"]:
+                                    self.ai_mode = label
                         # プレイヤー種別
                         for i in range(2):
                             for j in range(2):
@@ -462,7 +863,8 @@ class ReversiGame:
                                 if rect and rect.collidepoint(mx, my):
                                     self.player_types[i] = ["Human", "AI"][j]
                                     self.best_move = None
-                                    ai_waiting = False  # AI割り込み
+                                    ai_waiting = False
+                                    self.stop_pondering()
                         if self.slider_rect and self.slider_rect.collidepoint(mx, my):
                             self.slider_drag = True
                     if event.type == pygame.MOUSEBUTTONUP:
@@ -474,16 +876,34 @@ class ReversiGame:
                         v = int(round((mx - slider_x) / slider_w * 14)) + 1
                         v = max(1, min(15, v))
                         self.ai_depth = v
+                # Pondering: Human手番中は先読み
+                if not self.game_over and self.player_types[self.current_player-1] == "Human":
+                    if not self.ponder_thread or not self.ponder_thread.is_alive():
+                        self.start_pondering()
                 # AI自動手番
                 if not self.game_over and self.player_types[self.current_player-1] == "AI":
                     if not ai_waiting:
                         ai_last_time = time.time()
                         ai_waiting = True
                     elif time.time() - ai_last_time >= 0.5:
-                        move = self.find_best_move(self.current_player)
-                        if move:
-                            self.make_move(*move)
+                        # 先読み結果があれば利用
+                        move = None
+                        if self.ponder_result and self.ponder_move:
+                            # 直前のHuman手が予測通りなら先読み結果を使う
+                            last_move = None
+                            for y in range(BOARD_SIZE):
+                                for x in range(BOARD_SIZE):
+                                    if self.board[y][x] != 0:
+                                        continue
+                                    # 直前の盤面との差分でHuman手を推定
+                                    # ここでは省略的に先読みmoveと一致するかだけ判定
+                            if self.ponder_move in self.get_valid_moves(self.board, 3 - self.current_player):
+                                move = self.ponder_result
+                        if not move:
+                            move = self.find_best_move(self.current_player)
+                        self.make_move(*move)
                         ai_waiting = False
+                        self.stop_pondering()
                 else:
                     ai_waiting = False
                 pygame.display.update()
@@ -492,3 +912,46 @@ class ReversiGame:
             print("[ERROR]", e)
             traceback.print_exc()
             input("Press Enter to exit...")
+
+    def self_play_tuning(self, games=10):
+        # 簡易的な自己対戦による重み最適化（例示）
+        best_weights = None
+        best_score = -float('inf')
+        for trial in range(5):
+            # ランダムに重みを微調整
+            weights = [[w + random.randint(-5,5) for w in row] for row in [
+                [150, -40, 30, 10, 10, 30, -40, 150],
+                [-40, -60, -5, -5, -5, -5, -60, -40],
+                [30, -5, 20, 3, 3, 20, -5, 30],
+                [10, -5, 3, 3, 3, 3, -5, 10],
+                [10, -5, 3, 3, 3, 3, -5, 10],
+                [30, -5, 20, 3, 3, 20, -5, 30],
+                [-40, -60, -5, -5, -5, -5, -60, -40],
+                [150, -40, 30, 10, 10, 30, -40, 150],
+            ]]
+            score = 0
+            for g in range(games):
+                self.board = [[0]*BOARD_SIZE for _ in range(BOARD_SIZE)]
+                self.board[3][3] = self.board[4][4] = 2
+                self.board[3][4] = self.board[4][3] = 1
+                self.current_player = 1
+                for _ in range(60):
+                    move = self.find_best_move(self.current_player)
+                    if move:
+                        self.make_move(*move, animate=False)
+                    else:
+                        self.current_player = 3 - self.current_player
+                        if not self.get_valid_moves(self.board, self.current_player):
+                            break
+                black = sum(row.count(1) for row in self.board)
+                white = sum(row.count(2) for row in self.board)
+                if black > white:
+                    score += 1
+                elif white > black:
+                    score -= 1
+            if score > best_score:
+                best_score = score
+                best_weights = weights
+        # 最良の重みを採用
+        if best_weights:
+            self.weights = best_weights
