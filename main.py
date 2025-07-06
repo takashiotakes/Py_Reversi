@@ -987,7 +987,7 @@ class ReversiGame:
 
         empty_count = sum(row.count(0) for row in self.board)
         # 残り石数が少ない場合は、AI深度を自動調整
-        if empty_count <= 16: # 残り16マス以下で終盤と判断
+        if empty_count <= 15: # 残り15マス以下で完全読みに切り替え
             max_depth = empty_count
         else:
             max_depth = self.ai_depth
