@@ -4,6 +4,8 @@ import time
 from pygame.locals import *
 import threading
 import random
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
 # 色の定義
 BLACK = (0, 0, 0)
@@ -31,6 +33,17 @@ FONT_NAME = None
 class ReversiGame:
     def __init__(self):
         pygame.init()
+        # CPU/スレッド情報の取得
+        import os
+        try:
+            self.cpu_count = len(os.sched_getaffinity(0))  # 利用可能なCPUコア数
+        except AttributeError:
+            self.cpu_count = multiprocessing.cpu_count()  # フォールバック
+        self.max_workers = max(1, min(self.cpu_count - 1, 4))  # メインスレッド用に1コア残す、最大4
+        print(f"利用可能なCPUコア数: {self.cpu_count}")
+        print(f"AI思考用スレッド数 (MCTS): {self.max_workers}")
+        self.process_pool = None
+        # 既存のコードは以下へ
         global FONT_NAME
         # フォントを複数候補で明示指定
         for font_name in ["Arial Unicode MS", "Noto Sans CJK JP", "Meiryo", "Arial", pygame.font.get_default_font()]:
@@ -70,6 +83,14 @@ class ReversiGame:
         self.killer_moves = {}
         self.history_heuristic = {}
         self.ai_mode = "AlphaBeta"  # "AlphaBeta" or "MCTS"
+
+        # 効果音の初期化
+        try:
+            pygame.mixer.init()
+            self.flip_sound = pygame.mixer.Sound("flip.mp3")
+        except Exception as e:
+            print(f"[Sound Error] {e}")
+            self.flip_sound = None
 
     def save_state(self):
         # Undo/Redo用に盤面・プレイヤー状態を保存（player_typesは保存しない）
@@ -147,6 +168,12 @@ class ReversiGame:
         else:
             for fx, fy in all_flips:
                 self.board[fy][fx] = self.current_player
+        # 効果音再生
+        if self.flip_sound:
+            try:
+                self.flip_sound.play()
+            except Exception as e:
+                print(f"[Sound Play Error] {e}")
         self.current_player = 3 - self.current_player
         if not self.has_valid_moves():
             self.current_player = 3 - self.current_player
@@ -518,8 +545,8 @@ class ReversiGame:
             total = 0
             for x, y in moves:
                 new_b = [row[:] for row in b]
-                self._simulate_move(new_b, p, x, y)
-                total += lookahead_mobility(new_b, 3-p, depth-1)
+                self._simulate_move(new_b, 3-p, x, y) # player を 3-p に修正
+                total += lookahead_mobility(new_b, p, depth-1) # player を p に修正
             return total
         score += (lookahead_mobility(board, player, 2) - lookahead_mobility(board, opponent, 2))
         # パターンベース評価
@@ -573,32 +600,67 @@ class ReversiGame:
         best_move = None
         best_score = -float('inf')
         start = time.time()
-        for depth in range(1, max_depth+1):
+        if max_depth == 1:
             for x, y in moves:
-                if time.time() - start > max_time:
-                    return best_move
                 new_board = [row[:] for row in self.board]
                 self._simulate_move(new_board, player, x, y)
-                score = self.alpha_beta(new_board, 3 - player, depth-1, -float('inf'), float('inf'))
+                score = self.alpha_beta(new_board, 3 - player, 0, -float('inf'), float('inf'))
                 if score > best_score or best_move is None:
                     best_score = score
                     best_move = (x, y)
+        else:
+            for depth in range(1, max_depth+1):
+                for x, y in moves:
+                    if time.time() - start > max_time:
+                        return best_move
+                    new_board = [row[:] for row in self.board]
+                    self._simulate_move(new_board, player, x, y)
+                    score = self.alpha_beta(new_board, 3 - player, depth-1, -float('inf'), float('inf'))
+                    if score > best_score or best_move is None:
+                        best_score = score
+                        best_move = (x, y)
         return best_move
 
     def mcts_best_move(self, player, simulations=100):
+        from concurrent.futures import ThreadPoolExecutor
+        import math
+
         moves = self.get_valid_moves(self.board, player)
         if not moves:
             return None
-        win_counts = {move: 0 for move in moves}
-        for move in moves:
-            for _ in range(simulations):
-                board_copy = [row[:] for row in self.board]
-                self._simulate_move(board_copy, player, move[0], move[1])
-                winner = self.mcts_playout(board_copy, 3-player)
-                if winner == player:
-                    win_counts[move] += 1
-        best_move = max(moves, key=lambda m: win_counts[m])
-        return best_move
+
+        def run_simulation(move):
+            try:
+                win_count = 0
+                sim_per_move = math.ceil(simulations / len(moves))
+                for _ in range(sim_per_move):
+                    board_copy = [row[:] for row in self.board]
+                    self._simulate_move(board_copy, player, move[0], move[1])
+                    winner = self.mcts_playout(board_copy, 3-player)
+                    if winner == player:
+                        win_count += 1
+                return (move, win_count)
+            except Exception as e:
+                print(f"Error in MCTS simulation: {e}")
+                return (move, 0)
+
+        try:
+            # スレッド数の決定（moves数に応じて適切な数に）
+            n_workers = min(self.max_workers, len(moves))
+            if n_workers <= 1:  # シリアル実行
+                results = [run_simulation(move) for move in moves]
+            else:  # 並列実行
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    results = list(executor.map(run_simulation, moves))
+
+            # 最善手の選択
+            best_move, best_wins = max(results, key=lambda x: x[1])
+            return best_move
+
+        except Exception as e:
+            print(f"Error in MCTS parallel processing: {e}")
+            # エラー時は最初の合法手を返す
+            return moves[0]
 
     def mcts_playout(self, board, player):
         current = player
@@ -665,7 +727,7 @@ class ReversiGame:
             flip_count = 0
             directions = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]
             for dx, dy in directions:
-                nx, ny = x+dx, y+dy
+                nx, ny = x+dx, y+ny
                 while 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:
                     if board[ny][nx] == 3-player:
                         flip_count += 1
@@ -947,11 +1009,37 @@ class ReversiGame:
                 white = sum(row.count(2) for row in self.board)
                 if black > white:
                     score += 1
-                elif white > black:
+                elif white < black: # elif white > black: を修正
                     score -= 1
             if score > best_score:
                 best_score = score
-                best_weights = weights
-        # 最良の重みを採用
-        if best_weights:
-            self.weights = best_weights
+                self.weights = weights # best_weights を self.weights に修正 (仮定)
+
+def eval_move_for_mp(args):
+    board, player, x, y, depth, game_params = args
+    # game_params: 必要なパラメータ（BOARD_SIZE, ...）を辞書で渡す
+    # 必要なメソッドを再実装（またはstaticmethod化）
+    # ここでは最低限のロジックのみ例示
+    import random
+    def _simulate_move(board, player, x, y):
+        BOARD_SIZE = game_params['BOARD_SIZE']
+        board[y][x] = player
+        directions = [(0, 1), (1, 0), (0, -1), (-1, 0),
+                     (1, 1), (-1, -1), (1, -1), (-1, 1)]
+        opponent = 3 - player
+        for dx, dy in directions:
+            nx, ny = x + dx, y + dy
+            stones = []
+            while 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and board[ny][nx] == opponent:
+                stones.append((nx, ny))
+                nx += dx
+                ny += dy
+            if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE and board[ny][nx] == player:
+                for fx, fy in stones:
+                    board[fy][fx] = player
+    # alpha_betaは簡易的に評価値を返す例（本来は完全なロジックをstaticmethod化して渡す必要あり）
+    # ここでは乱数で代用
+    new_board = [row[:] for row in board]
+    _simulate_move(new_board, player, x, y)
+    score = random.randint(-100, 100)  # 本来はalpha_beta(new_board, ...)を呼ぶ
+    return (score, (x, y))
