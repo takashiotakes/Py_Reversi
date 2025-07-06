@@ -742,7 +742,7 @@ class ReversiGame:
         self.screen.blit(title_surface, (20, 10))
 
         # バージョン表示
-        version_surface = self.small_font.render("v0.14", True, GRAY if not self.dark_mode else LIGHT_GRAY)
+        version_surface = self.small_font.render("v1.00", True, GRAY if not self.dark_mode else LIGHT_GRAY)
         self.screen.blit(version_surface, (WINDOW_WIDTH - version_surface.get_width() - 20, 18))
 
         # スコア表示
